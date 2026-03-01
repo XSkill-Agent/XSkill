@@ -1,0 +1,11 @@
+logs/
+output/
+benchmark/
+memory_bank/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python

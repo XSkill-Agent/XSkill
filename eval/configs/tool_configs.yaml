@@ -1,0 +1,36 @@
+# Tool configurations
+# Provides default configuration parameters for each tool
+
+# CodeInterpreter configuration
+code_interpreter:
+  work_dir: "/tmp/code_interpreter"
+  output_timeout: 30
+
+  
+# Zoom configuration
+zoom:
+  work_dir: "/tmp/zoom"
+  output_timeout: 30
+
+
+# WebSearch configuration
+web_search:
+  max_results: 10
+  timeout: 10
+
+
+# Visit configuration
+visit:
+  max_content_length: 150000
+  timeout: 120
+  api_key: ""
+  api_endpoint: ""
+  model_name: "" 
+
+
+# ImageSearch configuration
+image_search:
+  imgbb_api_key: ""
+  max_results: 5
+  search_image_max_pixels: 1000000
+  search_image_quality: 85

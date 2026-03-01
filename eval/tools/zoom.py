@@ -1,0 +1,898 @@
+"""
+Zoom Tool - Zoom into specific regions of images by executing Python code.
+Allows examining image details by cropping and processing specific regions.
+"""
+
+import asyncio
+import ast
+import atexit
+import base64
+import concurrent.futures
+import io
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from typing import Dict, Set
+
+from PIL import Image
+from jupyter_client import BlockingKernelClient
+from tools.base import BaseTool
+from tools.tool_registry import register_tool
+
+# Constants
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
+KERNEL_INIT_POLL_INTERVAL = 0.1  # seconds
+KERNEL_INIT_MAX_WAIT = 10  # seconds
+KERNEL_INIT_SLEEP = 0.1  # seconds after initialization
+
+# Global variables for kernel management
+_KERNEL_CLIENTS: dict = {}
+_MISC_SUBPROCESSES: Dict[str, subprocess.Popen] = {}
+_KERNEL_LOCK = threading.Lock()  # Thread lock to protect global dictionaries
+
+LAUNCH_KERNEL_PY = """
+from ipykernel import kernelapp as app
+app.launch_new_instance()
+"""
+
+
+def _kill_kernels_and_subprocesses(_sig_num=None, _frame=None):
+    """Clean up all kernels and subprocesses."""
+    with _KERNEL_LOCK:
+        for v in list(_KERNEL_CLIENTS.values()):
+            try:
+                v.shutdown()
+            except:
+                pass
+        _KERNEL_CLIENTS.clear()
+        
+        for v in list(_MISC_SUBPROCESSES.values()):
+            try:
+                v.terminate()
+            except:
+                pass
+        _MISC_SUBPROCESSES.clear()
+
+
+# Register cleanup function
+if threading.current_thread() is threading.main_thread():
+    atexit.register(_kill_kernels_and_subprocesses)
+
+
+def execute_with_timeout(func, timeout, **kwargs):
+    """Execute a function with timeout support and graceful interruption.
+    
+    Note: Python threads cannot be truly killed, so after timeout:
+    1. Set stop_event to notify the function to exit
+    2. Use wait=False to avoid blocking
+    3. Caller must ensure kernel process is forcefully terminated
+    """
+    import time as time_module
+    import threading
+    start_time = time_module.time()
+    
+    # Create stop event for graceful interruption
+    stop_event = threading.Event()
+    kwargs['_stop_event'] = stop_event
+    
+    # Don't use with statement to avoid waiting for task completion on exit
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(func, **kwargs)
+        try:
+            result = future.result(timeout=timeout)
+            elapsed = time_module.time() - start_time
+            print(f"[ZoomTool] execute_with_timeout completed in {elapsed:.2f}s (timeout was {timeout}s)")
+            return result
+        except concurrent.futures.TimeoutError:
+            # Set stop event to notify function to exit early
+            stop_event.set()
+            # Try to cancel task (may be ineffective for already running tasks, but at least marks as cancelled)
+            future.cancel()
+            elapsed = time_module.time() - start_time
+            print(f"[ZoomTool] Execution timeout after {elapsed:.2f}s (limit: {timeout}s), stop event set")
+            return f'TimeoutError: Function execution timed out after {timeout} seconds.'
+        except Exception as e:
+            # Also set stop event when exception occurs
+            stop_event.set()
+            elapsed = time_module.time() - start_time
+            print(f"[ZoomTool] execute_with_timeout exception after {elapsed:.2f}s: {e}")
+            return f'Fatal Error: {e}'
+    finally:
+        # Use wait=False to return immediately, don't wait for timed-out tasks to complete
+        # Timed-out tasks will continue running in the background until completed or terminated by kernel
+        executor.shutdown(wait=False)
+
+
+@register_tool('zoom')
+class ZoomTool(BaseTool):
+    name = 'zoom'
+    description = '''
+Zoom into specific regions of an image by writing Python code to crop and examine details.
+Execute Python code in a stateful Jupyter kernel to precisely crop image regions.
+
+Primary Use Case:
+- Zoom in on specific regions of images to see fine details
+- Crop image areas based on coordinates, detected objects, or visual features
+- Use PIL's crop() method or custom image processing to extract regions of interest
+
+Image Variables (Pre-loaded as PIL Image objects):
+- original_image / original_image_N (N=1,2,3,...): The original input images are already loaded as PIL Image objects. The following code is automatically executed before your code:
+  ```python
+  from PIL import Image
+  original_image = Image.open('...')
+  original_image_1 = Image.open('...')  # if multiple images exist
+  ```
+  You can directly use these variables (e.g., `original_image`, `original_image_1`) without loading them again.
+- observation_N (N=1,2,3,...): Previously zoomed image regions from earlier zoom operations.
+- tool_image_N (N=1,2,3,...): Images generated by code_interpreter tool or previous zoom operations.
+
+How to Zoom:
+- To display the cropped region, return it, use plt.show(), or save it (e.g., cropped.save('zoomed.png'))
+- DO NOT use image.show()
+- The cropped/zoomed image will be available as "observation_N" in the next turn
+'''
+
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute in the Jupyter kernel"
+            }
+        },
+        "required": ["code"]
+    }
+    
+    def __init__(self, config=None):
+        super().__init__(config)
+        # Instance ID (generated before setting work directory)
+        self.instance_id = str(uuid.uuid4())
+        
+        # Set up work directory: create independent directory for each instance to avoid file conflicts
+        if config and 'work_dir' in config:
+            # If work_dir is specified in config, use it as base directory and create subdirectory per instance
+            # This ensures each instance has independent workspace to avoid conflicts during parallel execution
+            base_dir = config['work_dir']
+            self.work_dir = os.path.join(base_dir, self.instance_id)
+        else:
+            # Otherwise use default directory based on instance_id
+            default_base_dir = '/tmp/code_interpreter'
+            self.work_dir = os.path.join(default_base_dir, self.instance_id)
+        
+        os.makedirs(self.work_dir, exist_ok=True)
+        
+        # Output detection timeout (to detect if kernel is stuck)
+        # If no valid output (text/image/error) within this time, consider it timeout
+        # This is the only timeout mechanism, simpler and stricter
+        self.output_timeout = config.get('output_timeout', 30) if config else 30  # default 30 seconds
+        # If set to None or 0, considered disabled (not recommended, may cause infinite wait)
+        if self.output_timeout is None or self.output_timeout == 0:
+            self.output_timeout = None
+            # Raise exception immediately instead of waiting until execution
+            raise ValueError("output_timeout must be set and > 0. It is required for timeout detection.")
+    
+    def _is_kernel_file(self, filename: str) -> bool:
+        """Check if a file is kernel-related and should not be deleted."""
+        return filename.startswith(('kernel_connection_file_', 'launch_kernel_'))
+    
+    def _is_image_file(self, filename: str) -> bool:
+        """Check if a file is an image based on extension."""
+        return filename.lower().endswith(IMAGE_EXTENSIONS)
+    
+    def _get_kernel_id(self) -> str:
+        """Generate kernel ID for current instance, process and thread."""
+        import threading
+        thread_id = threading.get_ident()
+        return f'{self.instance_id}_{os.getpid()}_{thread_id}'
+    
+    def _process_image_output(self, msg: dict, served_images: set, observation_counter: int) -> tuple:
+        """
+        Process image output from kernel message.
+        
+        Args:
+            msg: Kernel message containing image data
+            served_images: Set to track served image filenames
+            observation_counter: Current counter for observation images
+            
+        Returns:
+            Tuple of (image_markdown, updated_counter)
+        """
+        data = msg.get('content', {}).get('data', {})
+        if 'image/png' in data:
+            image_b64 = data['image/png']
+            image_url = self._serve_image(image_b64)
+            if os.path.isfile(image_url):
+                served_images.add(os.path.basename(image_url))
+            observation_counter += 1
+            return f'![observation_{observation_counter}]({image_url})', observation_counter
+        return '', observation_counter
+    
+    def _clean_work_dir(self, input_image_files: Set[str] = None):
+        """
+        Clean input image files in work directory while preserving user-saved images.
+        
+        Cleaning strategy:
+        1. Preserve kernel-related files (kernel_connection_file_*, launch_kernel_*)
+        2. Only delete input image files (passed via image_map, will be re-injected in this call)
+        3. Preserve user-saved image files (for cross-step access)
+        4. Delete other user-generated files (.py, .txt, .csv, etc., excluding kernel files)
+        """
+        if not os.path.exists(self.work_dir):
+            return
+        
+        # Track input image filenames (passed via image_map)
+        input_files = input_image_files if input_image_files else set()
+        
+        try:
+            for f in os.listdir(self.work_dir):
+                file_path = os.path.join(self.work_dir, f)
+                
+                # Skip kernel-related files
+                if self._is_kernel_file(f):
+                    continue
+                
+                # Only delete input image files, preserve user-saved images
+                if self._is_image_file(f):
+                    if f in input_files:
+                        # This is an input image, can be deleted (will be re-injected in this call)
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+                    # else: user-saved image, keep it
+                
+                # Delete other user-generated files (but preserve kernel files)
+                if f.endswith(('.py', '.txt', '.csv', '.json')) and not f.startswith('kernel_'):
+                    if 'kernel' not in f.lower() and 'connection' not in f.lower():
+                        try:
+                            os.remove(file_path)
+                        except OSError:
+                            pass
+        except Exception as e:
+            # Cleaning failure should not affect code execution
+            print(f"[ZoomTool] Warning: Failed to clean work_dir: {e}")
+    
+    def call(self, params, image_map: Dict[str, Image.Image] = None, **kwargs):
+        """
+        Execute Python code, optionally process incoming images
+
+        Args:
+            params: Dictionary or string containing code
+            image_map (Dict[str, Image.Image], optional): Mapping of image identifiers to PIL Image objects.
+            **kwargs: Additional parameters
+            
+        Returns:
+            Code execution result
+        """
+        # Parse parameters
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except json.JSONDecodeError:
+                # If not JSON, treat as code directly
+                code = params
+        else:
+            code = params.get('code', '')
+        
+        # Extract code (handle markdown code blocks)
+        triple_match = re.search(r'```[^\n]*\n(.+?)```', code, re.DOTALL)
+        if triple_match:
+            code = triple_match.group(1)
+        
+        if not code.strip():
+            return 'Error: No code provided'
+        
+        # Record input image filenames (for cleanup identification)
+        # Support multiple image formats
+        input_image_files = set()
+        if image_map:
+            for name in image_map.keys():
+                var_name = re.sub(r'[^a-zA-Z0-9_]', '', name)
+                if var_name:
+                    # Record all possible extensions (actually saved as PNG, but compatible with other formats)
+                    for ext in IMAGE_EXTENSIONS:
+                        input_image_files.add(f'{var_name}{ext}')
+                # Support both 'original_image' and 'original_image_*' for alias
+                if name == 'original_image' or name.startswith('original_image_'):
+                    # Alias files also support multiple formats
+                    for ext in IMAGE_EXTENSIONS:
+                        input_image_files.add(f'image{ext}')
+        
+        # Clean work directory: only delete input images, preserve user-saved images
+        self._clean_work_dir(input_image_files)
+        
+        # Count existing observation_* for image naming
+        observation_count = 0
+        if image_map:
+            observation_count = len([k for k in image_map.keys() if k.startswith('observation_')])
+        
+        # Image processing and code injection
+        image_load_code = ''
+        if image_map:
+            image_load_code += 'from PIL import Image\n'
+            # Sort image names to ensure consistent ordering (original_image first, then original_image_1, etc.)
+            sorted_image_items = sorted(image_map.items(), key=lambda x: (
+                0 if x[0] == 'original_image' else (1 if x[0].startswith('original_image_') else 2),
+                x[0]
+            ))
+            
+            for name, img in sorted_image_items:
+                # Clean variable name to ensure validity
+                var_name = re.sub(r'[^a-zA-Z0-9_]', '', name)
+                if not var_name:
+                    continue
+                
+                # Save image to work directory
+                file_path = os.path.join(self.work_dir, f'{var_name}.png')
+                img.save(file_path)
+                
+                # Create loading code
+                image_load_code += f"{var_name} = Image.open('{file_path}')\n"
+            
+            # If image_map has original_image, automatically create image.png alias
+            # This allows user code to use 'image.png' normally
+            # Also create image variable as alias for original_image (backward compatibility)
+            if 'original_image' in image_map:
+                image_alias_path = os.path.join(self.work_dir, 'image.png')
+                image_map['original_image'].save(image_alias_path)
+                # Create image variable as alias for original_image
+                image_load_code += "image = original_image\n"
+        
+        # Merge image loading code with user code
+        full_code = image_load_code + code
+
+        # Safety check
+        if 'exit' in code.lower():
+            return 'Error: Using exit() is not allowed'
+        
+        # Syntax check
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return f'SyntaxError: {e}'
+        
+        # After saving input images, record file list before execution (to detect newly generated images)
+        # This excludes input images and previously preserved user-saved files
+        existing_image_files = set()
+        if os.path.exists(self.work_dir):
+            for f in os.listdir(self.work_dir):
+                if self._is_image_file(f) and not self._is_kernel_file(f):
+                    existing_image_files.add(f)
+        
+        print(f"[ZoomTool] Executing code:\n{full_code[:300]}...")
+        
+        try:
+            # Get or create kernel
+            # Include thread ID to ensure isolation in parallel execution (multi-rollout scenarios)
+            kernel_id = self._get_kernel_id()
+            
+            # Use lock to protect global dictionary access, use double-check pattern
+            kc = None
+            with _KERNEL_LOCK:
+                if kernel_id in _KERNEL_CLIENTS:
+                    kc = _KERNEL_CLIENTS[kernel_id]
+            
+            # If kernel does not exist, start outside lock (to avoid long lock holding blocking other threads)
+            if kc is None:
+                try:
+                    new_kc, new_subproc = self._start_kernel(kernel_id)
+                    # No longer use signal mechanism timeout, only rely on output detection timeout
+                except Exception as e:
+                    print(f"[ZoomTool] ERROR - Failed to start kernel {kernel_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                
+                with _KERNEL_LOCK:
+                    # Double-check to avoid duplicate creation
+                    if kernel_id not in _KERNEL_CLIENTS:
+                        _KERNEL_CLIENTS[kernel_id] = new_kc
+                        _MISC_SUBPROCESSES[kernel_id] = new_subproc
+                        kc = new_kc
+                    else:
+                        # Another thread has already created, use existing one
+                        kc = _KERNEL_CLIENTS[kernel_id]
+                        # Close recently created kernel (to avoid resource leak)
+                        try:
+                            new_kc.shutdown()
+                            new_subproc.terminate()
+                        except Exception:
+                            pass
+            
+            # Execute code
+            full_code += '\n\n'  # Ensure code ends with a newline
+            
+            # Calculate execution timeout: use output timeout * 2 as fallback
+            # Mainly rely on output detection timeout to detect deadlocks, but execute_with_timeout needs a timeout parameter
+            # Use output timeout * 2 as fallback, ensure even if output detection fails will not wait indefinitely
+            # output_timeout has already been validated in __init__, so it should not be None here
+            if self.output_timeout is None or self.output_timeout <= 0:
+                raise ValueError("output_timeout must be set and > 0. It is required for timeout detection.")
+            execution_timeout = self.output_timeout * 2
+            
+            result = execute_with_timeout(
+                self._execute_code, 
+                execution_timeout, 
+                kc=kc, 
+                code=full_code,
+                existing_image_files=existing_image_files,
+                kernel_id=kernel_id,
+                observation_start_count=observation_count
+            )
+            
+            print(f"[ZoomTool] Execution completed")
+            return result if result.strip() else 'Finished execution.'
+            
+        except Exception as e:
+            error_msg = f"Error executing code: {str(e)}"
+            print(f"[ZoomTool] {error_msg}")
+            return error_msg
+    
+    def _start_kernel(self, kernel_id: str):
+        """Start a Jupyter kernel"""
+        connection_file = os.path.join(self.work_dir, f'kernel_connection_file_{kernel_id}.json')
+        launch_kernel_script = os.path.join(self.work_dir, f'launch_kernel_{kernel_id}.py')
+        
+        # Clean old files
+        for f in [connection_file, launch_kernel_script]:
+            if os.path.exists(f):
+                os.remove(f)
+        
+        # Create launch script
+        with open(launch_kernel_script, 'w') as fout:
+            fout.write(LAUNCH_KERNEL_PY)
+        
+        # Start kernel process
+        # Suppress stderr output to avoid ZMQ async callback errors polluting logs
+        try:
+            kernel_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    os.path.abspath(launch_kernel_script),
+                    '--IPKernelApp.connection_file',
+                    os.path.abspath(connection_file),
+                    '--matplotlib=inline',
+                    '--quiet',
+                ],
+                cwd=os.path.abspath(self.work_dir),
+                stderr=subprocess.DEVNULL,  # Suppress kernel process stderr output
+            )
+        except Exception as e:
+            print(f"[ZoomTool] ERROR - Failed to start kernel process: {e}")
+            raise
+        
+        # Wait for connection file creation
+        max_wait = KERNEL_INIT_MAX_WAIT
+        wait_time = 0
+        while not os.path.isfile(connection_file) and wait_time < max_wait:
+            time.sleep(KERNEL_INIT_POLL_INTERVAL)
+            wait_time += KERNEL_INIT_POLL_INTERVAL
+        
+        if not os.path.isfile(connection_file):
+            error_msg = f"Kernel connection file not created after {max_wait}s"
+            print(f"[ZoomTool] ERROR - {error_msg}")
+            try:
+                kernel_process.terminate()
+            except:
+                pass
+            raise RuntimeError(error_msg)
+        
+        # Wait for file to be readable
+        while wait_time < max_wait:
+            try:
+                with open(connection_file, 'r') as fp:
+                    json.load(fp)
+                break
+            except (json.JSONDecodeError, IOError) as e:
+                time.sleep(KERNEL_INIT_POLL_INTERVAL)
+                wait_time += KERNEL_INIT_POLL_INTERVAL
+                if wait_time >= max_wait:
+                    error_msg = f"Connection file not readable after {max_wait}s: {e}"
+                    print(f"[ZoomTool] ERROR - {error_msg}")
+                    try:
+                        kernel_process.terminate()
+                    except:
+                        pass
+                    raise RuntimeError(error_msg)
+        
+        # Create client
+        try:
+            kc = BlockingKernelClient(connection_file=connection_file)
+        except Exception as e:
+            print(f"[ZoomTool] ERROR - Failed to create BlockingKernelClient: {e}")
+            try:
+                kernel_process.terminate()
+            except:
+                pass
+            raise
+        
+        # Set event loop policy (for compatibility)
+        try:
+            asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
+        except Exception:
+            pass  # Ignore event loop policy setup failure
+        
+        try:
+            kc.load_connection_file()
+            kc.start_channels()
+            kc.wait_for_ready()
+        except Exception as e:
+            print(f"[ZoomTool] ERROR - Failed to initialize kernel client: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                kc.shutdown()
+                kernel_process.terminate()
+            except:
+                pass
+            raise
+        
+        return kc, kernel_process
+    
+    def _is_valid_output(self, msg_type: str, msg: dict) -> bool:
+        """
+        Determine if a message is valid output (for output detection timeout).
+        
+        Args:
+            msg_type: Message type
+            msg: Message content
+            
+        Returns:
+            bool: Whether it's valid output
+        """
+        if msg_type == 'status':
+            # Status messages don't count as valid output (just state updates)
+            return False
+        elif msg_type == 'execute_result':
+            # Check if there's actual content
+            data = msg.get('content', {}).get('data', {})
+            if 'image/png' in data:
+                return True  # Images count as valid output
+            text = data.get('text/plain', '')
+            return bool(text and text.strip())  # Only counts if there's text content
+        elif msg_type == 'display_data':
+            # Check if there's image or text
+            data = msg.get('content', {}).get('data', {})
+            if 'image/png' in data:
+                return True
+            text = data.get('text/plain', '')
+            return bool(text and text.strip())
+        elif msg_type == 'stream':
+            # Stream output counts as valid output
+            text = msg.get('content', {}).get('text', '')
+            return bool(text and text.strip())
+        elif msg_type == 'error':
+            # Errors also count as valid output (at least we know something went wrong)
+            return True
+        return False
+    
+    def _interrupt_kernel(self, kernel_id, kc):
+        """Interrupt kernel execution.
+        
+        Attempts multiple methods to interrupt kernel:
+        1. Send interrupt message via shell channel (if supported)
+        2. Send SIGINT signal to kernel process
+        3. If SIGINT fails, send SIGKILL to forcefully terminate
+        4. Clean up kernel references in global dictionaries
+        """
+        if kernel_id is None:
+            print(f"[ZoomTool] Cannot interrupt kernel: kernel_id is None")
+            return
+        
+        # Method 1: Try sending interrupt message via shell channel
+        try:
+            # BlockingKernelClient might not have interrupt() method, try via shell channel
+            if hasattr(kc, 'interrupt'):
+                kc.interrupt()
+                print(f"[ZoomTool] Kernel interrupt via interrupt() method")
+        except Exception as e:
+            print(f"[ZoomTool] Failed to interrupt kernel via client: {e}")
+        
+        # Method 2: Send SIGINT signal to kernel process, if ineffective use SIGKILL
+        kernel_process = None
+        try:
+            with _KERNEL_LOCK:
+                if kernel_id in _MISC_SUBPROCESSES:
+                    kernel_process = _MISC_SUBPROCESSES[kernel_id]
+        except Exception as e:
+            print(f"[ZoomTool] Failed to get kernel process: {e}")
+        
+        if kernel_process and kernel_process.poll() is None:  # Process still running
+            try:
+                # First send SIGINT
+                kernel_process.send_signal(signal.SIGINT)
+                print(f"[ZoomTool] Kernel interrupt via SIGINT signal sent to process")
+                
+                # Wait a moment to see if process responds
+                time.sleep(1.0)
+                
+                if kernel_process.poll() is None:
+                    # SIGINT ineffective, use SIGKILL to forcefully terminate
+                    print(f"[ZoomTool] Kernel process not responding to SIGINT, sending SIGKILL")
+                    kernel_process.kill()  # Equivalent to send_signal(signal.SIGKILL)
+                    time.sleep(0.5)
+                    
+                    if kernel_process.poll() is None:
+                        print(f"[ZoomTool] WARNING: Kernel process still running after SIGKILL")
+                    else:
+                        print(f"[ZoomTool] Kernel process terminated via SIGKILL")
+                else:
+                    print(f"[ZoomTool] Kernel process terminated via SIGINT")
+                    
+            except Exception as e:
+                print(f"[ZoomTool] Failed to terminate kernel process: {e}")
+        
+        # Method 3: Clean kernel references in global dictionary (ensure kernel is recreated on next call)
+        try:
+            with _KERNEL_LOCK:
+                if kernel_id in _KERNEL_CLIENTS:
+                    try:
+                        _KERNEL_CLIENTS[kernel_id].shutdown()
+                    except:
+                        pass
+                    del _KERNEL_CLIENTS[kernel_id]
+                    print(f"[ZoomTool] Kernel client removed from cache")
+                if kernel_id in _MISC_SUBPROCESSES:
+                    del _MISC_SUBPROCESSES[kernel_id]
+                    print(f"[ZoomTool] Kernel process removed from cache")
+        except Exception as e:
+            print(f"[ZoomTool] Failed to cleanup kernel references: {e}")
+    
+    def _execute_code(self, kc, code: str, existing_image_files=None, _stop_event=None, kernel_id=None, observation_start_count=0) -> str:
+        """Execute code and get results (simplified version, using signal mechanism for timeout).
+        
+        Args:
+            kc: Kernel client
+            code: Code to execute
+            existing_image_files: Set of image files that exist before execution (if None, will scan directory)
+            _stop_event: threading.Event object for graceful interruption
+            kernel_id: Kernel ID for interrupting kernel process
+            observation_start_count: Number of existing observation_* for image naming
+        """
+        # Use provided existing_image_files, if not provided scan directory
+        if existing_image_files is None:
+            existing_image_files = set()
+            if os.path.exists(self.work_dir):
+                for f in os.listdir(self.work_dir):
+                    if self._is_image_file(f) and not self._is_kernel_file(f):
+                        existing_image_files.add(f)
+        
+        served_images = set()  # Track image filenames saved via _serve_image
+        
+        try:
+            kc.wait_for_ready()
+        except Exception as e:
+            return f'Fatal Error: Kernel is not ready. {str(e)}'
+        
+        # Execute code
+        try:
+            kc.execute(code)
+        except Exception as e:
+            return f'Fatal Error: Failed to execute code. {str(e)}'
+        
+        result = ''
+        image_idx = 0
+        observation_counter = observation_start_count
+        start_time = time.time()
+        
+        # Output detection timeout: track last valid output time
+        last_output_time = start_time  # Initialize to start time
+        output_timeout_enabled = self.output_timeout is not None and self.output_timeout > 0
+        
+        if not output_timeout_enabled:
+            raise ValueError("output_timeout must be set and > 0. It is required for timeout detection.")
+        
+        while True:
+            text = ''
+            image = ''
+            finished = False
+            msg_type = 'error'
+            
+            # ========== Unified checkpoint: Timeout and interrupt check ==========
+            # 1. Check stop flag (from execute_with_timeout)
+            if _stop_event and _stop_event.is_set():
+                text = 'TimeoutError: Execution was interrupted due to timeout.'
+                print(f"[ZoomTool] Stop event detected, interrupting execution")
+                # Try to interrupt kernel
+                self._interrupt_kernel(kernel_id, kc)
+                if text:
+                    result += f'\n\nerror:\n\n```\n{text}\n```'
+                finished = True
+                break
+            
+            # 2. Check output detection timeout
+            time_since_last_output = time.time() - last_output_time
+            
+            if time_since_last_output >= self.output_timeout:
+                text = f'TimeoutError: No output received for {time_since_last_output:.1f} seconds (output_timeout: {self.output_timeout}s). The kernel may be unresponsive or stuck.'
+                print(f"[ZoomTool] Output timeout detected: {time_since_last_output:.1f}s without valid output")
+                # Try to interrupt kernel
+                self._interrupt_kernel(kernel_id, kc)
+                if text:
+                    result += f'\n\nerror:\n\n```\n{text}\n```'
+                finished = True
+                break
+            
+            try:
+                # Set single wait time: limit to 10 seconds to avoid long blocking
+                # Calculate how much time until output timeout
+                time_until_output_timeout = self.output_timeout - time_since_last_output
+                # Take minimum: time until output timeout, 10 seconds
+                single_wait_timeout = min(max(1, time_until_output_timeout), 10)
+                
+                # Check stop flag again before waiting for message (avoid long blocking)
+                if _stop_event and _stop_event.is_set():
+                    continue
+                
+                # Block and wait for message, but with timeout
+                msg = kc.get_iopub_msg(timeout=single_wait_timeout)
+                msg_type = msg.get('msg_type', 'unknown')
+                
+                # Check if it's valid output and update last output time
+                if output_timeout_enabled and self._is_valid_output(msg_type, msg):
+                    last_output_time = time.time()
+                    print(f"[ZoomTool] Received valid output (type: {msg_type}), resetting output timeout timer")
+                
+                # Handle various message types
+                if msg_type == 'status':
+                    execution_state = msg.get('content', {}).get('execution_state', 'unknown')
+                    if execution_state == 'idle':
+                        finished = True
+                    # status message is not valid output, do not reset output timer
+                        
+                elif msg_type == 'execute_result':
+                    content_data = msg.get('content', {}).get('data', {})
+                    text = content_data.get('text/plain', '')
+                    image, observation_counter = self._process_image_output(msg, served_images, observation_counter)
+                        
+                elif msg_type == 'display_data':
+                    image, observation_counter = self._process_image_output(msg, served_images, observation_counter)
+                    if not image:  # If no image, check for text
+                        content_data = msg.get('content', {}).get('data', {})
+                        text = content_data.get('text/plain', '')
+                        
+                elif msg_type == 'stream':
+                    msg_type = msg.get('content', {}).get('name', 'stdout')  # stdout or stderr
+                    text = msg.get('content', {}).get('text', '')
+                    
+                elif msg_type == 'error':
+                    traceback_list = msg.get('content', {}).get('traceback', [])
+                    error_text = _escape_ansi('\n'.join(traceback_list))
+                    text = error_text
+                    
+            except queue.Empty:
+                # Message queue timeout: continue loop, let unified checkpoint handle output timeout
+                # If just single wait timeout but not yet output timeout, continue loop
+                # If already output timeout, unified checkpoint will handle it on next iteration
+                continue
+                
+            except (ValueError, ConnectionError, OSError) as e:
+                # ZMQ/connection related errors
+                error_msg = str(e)
+                if result.strip():
+                    # If there's already partial result, return it
+                    finished = True
+                else:
+                    text = f'Error: {error_msg}. Kernel communication may be interrupted.'
+                    finished = True
+                    
+            except BaseException as e:
+                # Catch all other exceptions
+                error_msg = str(e)
+                error_type = type(e).__name__
+                print(f"[ZoomTool] FATAL - {error_type}: {error_msg}")
+                import traceback
+                traceback.print_exc()
+                
+                text = f'Fatal Error ({error_type}): {error_msg}. The code interpreter encountered an unexpected error.'
+                finished = True
+            
+            if text:
+                result += f'\n\n{msg_type}:\n\n```\n{text}\n```'
+            if image:
+                result += f'\n\n{image}'
+            if finished:
+                break
+        
+        # Check if output timeout caused early exit
+        is_output_timeout = output_timeout_enabled and result and "No output received" in result
+        
+        if is_output_timeout:
+            print(f"[ZoomTool] Skipping image scan due to output timeout, returning immediately")
+            return result.lstrip('\n')
+        
+        # After code execution, scan work directory to find newly generated image files
+        # Since each instance has a separate work directory, just compare file names
+        new_image_files = []
+        if os.path.exists(self.work_dir):
+            for f in os.listdir(self.work_dir):
+                if self._is_image_file(f):
+                    # Exclude known files (like kernel connection files, launch scripts, etc.)
+                    if self._is_kernel_file(f):
+                        continue
+                    # Exclude images already returned via execute_result/display_data (avoid duplicates)
+                    if f in served_images:
+                        continue
+                    # Only add newly generated files
+                    if f not in existing_image_files:
+                        new_image_files.append(f)
+        
+        # Add newly generated image files to result
+        for img_file in sorted(new_image_files):
+            image_path = os.path.join(self.work_dir, img_file)
+            if os.path.exists(image_path):
+                observation_counter += 1
+                # Use absolute path to ensure api_processors.py can find file correctly
+                abs_image_path = os.path.abspath(image_path)
+                result += f'\n\n![observation_{observation_counter}]({abs_image_path})'
+                print(f"[ZoomTool] Auto-detected saved image: {img_file} -> {abs_image_path}")
+        
+        return result.lstrip('\n')
+    
+    def _serve_image(self, image_base64: str) -> str:
+        """Save image and return path"""
+        image_file = f'{uuid.uuid4()}.png'
+        local_image_file = os.path.join(self.work_dir, image_file)
+        
+        png_bytes = base64.b64decode(image_base64)
+        bytes_io = io.BytesIO(png_bytes)
+        Image.open(bytes_io).save(local_image_file, 'png')
+        
+        return local_image_file
+    
+    def __del__(self):
+        """Clean up resources."""
+        # Clean up kernel for this instance in current thread
+        try:
+            kernel_id = self._get_kernel_id()
+            
+            with _KERNEL_LOCK:
+                if kernel_id in _KERNEL_CLIENTS:
+                    try:
+                        _KERNEL_CLIENTS[kernel_id].shutdown()
+                    except:
+                        pass
+                    del _KERNEL_CLIENTS[kernel_id]
+                if kernel_id in _MISC_SUBPROCESSES:
+                    try:
+                        _MISC_SUBPROCESSES[kernel_id].terminate()
+                    except:
+                        pass
+                    del _MISC_SUBPROCESSES[kernel_id]
+        except:
+            # Ignore all errors to avoid exceptions during destruction
+            pass
+
+
+def _escape_ansi(line: str) -> str:
+    """Remove ANSI escape sequences"""
+    ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', line)
+
+
+# Event loop policy (for compatibility)
+if sys.platform == 'win32' and hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
+    _BasePolicy = asyncio.WindowsSelectorEventLoopPolicy
+else:
+    _BasePolicy = asyncio.DefaultEventLoopPolicy
+
+
+class AnyThreadEventLoopPolicy(_BasePolicy):
+    """Event loop policy that allows creating event loops in any thread."""
+    
+    def get_event_loop(self) -> asyncio.AbstractEventLoop:
+        try:
+            return super().get_event_loop()
+        except RuntimeError:
+            loop = self.new_event_loop()
+            self.set_event_loop(loop)
+            return loop
+
