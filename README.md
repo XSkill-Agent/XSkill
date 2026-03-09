@@ -183,15 +183,29 @@ with `"images": ["VisualProbe/val/img_001.jpg"]` will load `/data/benchmark/Visu
 
 
 
-## Running Inference
+## Running
 
-Edit the data and output paths in `eval/run_api_exskill.sh`, then:
+### 1. XSkill Accumulation (Phase I)
+
+To autonomously accumulate structured experiences and skills from agent trajectories, run:
 
 ```bash
-bash eval/run_api_exskill.sh
+bash eval/run_exskill_train.sh
 ```
 
-### Key Parameters
+This script enables online experience generation and skill library updates.
+
+### 2. Inference with XSkill (Phase II)
+
+To evaluate the agent using the accumulated memory bank, run:
+
+```bash
+bash eval/run_exskill_inference.sh
+```
+
+This script focuses on reasoning without updating the library.
+
+### Key Parameters Reference
 
 #### Data & Output
 
