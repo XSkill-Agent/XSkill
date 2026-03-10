@@ -19,7 +19,7 @@ Multimodal agents demonstrate impressive problem-solving capabilities but typica
 
 XSkill operates in two phases. **Phase I (Accumulation)**: after each batch of rollouts, the agent distills structured skill documents and experience entries via visually-grounded trajectory summarization, cross-rollout critique, and hierarchical consolidation. **Phase II (Inference)**: for each test sample, the system decomposes the task, retrieves relevant knowledge from the memory bank, adapts it to the current visual context, and injects it into the system prompt.
 
-Evaluated on diverse benchmarks (VisualToolBench, TIR-Bench, MMSearch-Plus, RealX-Bench, MMBrowseComp), XSkill achieves considerable performance gains over strong baselines across different backbone models, with superior zero-shot cross-task transferability.
+Evaluated on diverse benchmarks (VisualToolBench, TIR-Bench, MMSearch-Plus, AgentVista, MMBrowseComp), XSkill achieves considerable performance gains over strong baselines across different backbone models, with superior zero-shot cross-task transferability.
 
 ---
 
