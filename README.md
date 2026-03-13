@@ -4,10 +4,10 @@
   <a href="https://arxiv.org/pdf/2603.12056">
     <img src="https://img.shields.io/badge/paper-A42C25?style=for-the-badge&logo=arxiv&logoColor=white" alt="Paper">
   </a>
-  <a href="https://github.com/DjangoJungle/XSkill">
+  <a href="https://github.com/XSkill-Agent/XSkill">
     <img src="https://img.shields.io/badge/GitHub-000000?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
   </a>
-  <a href="https://djangojungle.github.io/exskill_page">
+  <a href="https://xskill-agent.github.io/xskill_page/">
     <img src="https://img.shields.io/badge/Webpage-blue?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Webpage">
   </a>
 </p>
@@ -303,11 +303,14 @@ A dataset-level summary is written to `output/<run_name>/summary_k.json`.
 If you use XSkill in your research, please cite:
 
 ```bibtex
-@inproceedings{exskill2026,
-  title     = {{XSkill}: Continual Learning from Experience and Skills in Multimodal Agents},
-  author    = {Author One and Author Two and Author Three},
-  booktitle = {Conference Name},
-  year      = {2026},
+@misc{jiang2026xskillcontinuallearningexperience,
+      title={XSkill: Continual Learning from Experience and Skills in Multimodal Agents}, 
+      author={Guanyu Jiang and Zhaochen Su and Xiaoye Qu and Yi R. Fung},
+      year={2026},
+      eprint={2603.12056},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2603.12056}, 
 }
 ```
 
