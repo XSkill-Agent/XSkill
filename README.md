@@ -130,14 +130,6 @@ image_search:
   search_image_quality: 85
 ```
 
-> **Image hosting for reverse image search.** When the agent performs a reverse image search on a local image, the image must first be uploaded to a publicly accessible URL. `image_search.py` supports the following hosting services in priority order:
-> 1. **ImgBB** (`imgbb_api_key`) — Recommended. Stable and reliable; requires a free API key from [imgbb.com](https://api.imgbb.com).
-> 2. **cloudflareimg.cdn.sn** — No registration required; supports WebP compression automatically.
-> 3. **0x0.st** — Anonymous upload service; no registration required.
-> 4. **catbox.moe** — Anonymous backup service; no registration required.
->
-> If `imgbb_api_key` is left empty, the tool automatically falls back to the anonymous services above. You can also add or replace hosting services by editing `eval/tools/image_search.py` (`_upload_local_image`).
-
 ---
 
 ## Data Format and Preparation
@@ -182,6 +174,7 @@ All image paths in the `images` field are resolved relative to `--image-folder`.
 with `"images": ["VisualProbe/val/img_001.jpg"]` will load `/data/benchmark/VisualProbe/val/img_001.jpg`.
 
 
+---
 
 ## Running
 
@@ -203,100 +196,7 @@ To evaluate the agent using the accumulated memory bank, run:
 bash eval/run_exskill_inference.sh
 ```
 
-This script focuses on reasoning without updating the library.
 
-### Key Parameters Reference
-
-#### Data & Output
-
-| Variable | Argument | Description |
-|---|---|---|
-| `DATA_PATH` | `--input-file` | Path to the benchmark JSON file |
-| `IMAGE_DIR` | `--image-folder` | Root directory for benchmark images |
-| `OUTPUT_DIR` | `--output-dir` | Directory to save per-sample results |
-| `MAX_SAMPLES` | `--max-samples` | Limit number of samples (useful for debugging) |
-
-#### Inference
-
-| Variable | Argument | Description |
-|---|---|---|
-| `MAX_TURNS` | `--max-turns` | Max agent turns per rollout (default: 20) |
-| `MAX_TOTAL_TOKENS` | `--max-total-tokens` | Max context tokens per turn (default: 32768) |
-| `TEMPERATURE` | `--temperature` | Sampling temperature (default: 0.6) |
-| `ROLLOUTS_PER_SAMPLE` | `--rollouts-per-sample` | Independent rollouts per sample; >1 enables pass@k / avg@k evaluation |
-| `NUM_WORKERS` | `--num-workers` | Parallel workers (set to match your API rate limit) |
-| `SYSTEM_PROMPT_TYPE` | `--system-prompt-key` | Agent prompt variant: `multi_tool_agent` (default), `multi_tool_agent_search`, `multi_tool_agent_code`, `agent_zoom`, `direct_cot` |
-
-#### Tools
-
-| Variable | Argument | Description |
-|---|---|---|
-| `ENABLED_TOOLS` | (env var) | Comma-separated list of active tools: `web_search`, `visit`, `code_interpreter`, `image_search`, `zoom` |
-| `WEB_SEARCH_MAX_CALLS` | `--web-search-max-calls` | Max `web_search` calls per sample (default: 7) |
-| `IMAGE_SEARCH_MAX_CALLS` | `--image-search-max-calls` | Max `image_search` calls per sample (default: 5) |
-
-#### Experience Library
-
-| Variable | Argument | Description |
-|---|---|---|
-| `EXPERIENCE_LIBRARY` | `--experience-library` | Path to the experience JSON file (created automatically if absent) |
-| `EXPERIENCE_MAX_OPS` | `--experience-max-ops` | Max experience operations extracted per sample critique (default: 3) |
-| `EXPERIENCE_MAX_ITEMS` | `--experience-max-items` | Max entries kept in the experience library (default: 120) |
-| `EXPERIENCE_LARGE_BATCH` | `--experience-large-batch` | Number of rollouts to accumulate before triggering batch experience generation |
-| `EXPERIENCE_RETRIEVAL_TOP_K` | `--experience-retrieval-top-k` | Number of experiences retrieved per query (default: 3) |
-| — | `--experience-enable` | Enable experience injection at inference time |
-| — | `--experience-online-generate` | Generate experiences from trajectories after each batch |
-| — | `--experience-library-update` | Merge new experiences back into the library |
-| — | `--experience-retrieval` | Use embedding-based retrieval instead of injecting all experiences |
-| — | `--experience-retrieval-decomposition` | Decompose the task into subtasks before retrieval |
-| — | `--experience-retrieval-rewrite` | Rewrite retrieved experiences to fit the current task |
-| — | `--experience-refine` | Periodically consolidate and trim the experience library |
-
-#### Skill Library
-
-| Variable | Argument | Description |
-|---|---|---|
-| `SKILL_LIBRARY` | `--skill-library` | Path to the skill document (`SKILL.md`; created automatically if absent) |
-| `SKILL_MAX_LENGTH` | `--skill-max-length` | Word count threshold to trigger skill document refinement (default: 1000) |
-| — | `--skill-enable` | Enable skill generation from trajectories |
-| — | `--skill-inference` | Inject the (adapted) skill document into the system prompt at inference time |
-| — | `--skill-refine` | Periodically consolidate and trim the skill document |
-| — | `--no-skill-adaptation` | Inject the raw skill document without per-sample adaptation (default: adapt) |
-
----
-
-## Memory Bank
-
-The memory bank stores the accumulated experience library and skill document across runs:
-
-```
-memory_bank/
-└── <run_name>/
-    ├── experiences.json    # Structured experience library
-    └── SKILL.md            # Global skill document
-```
-
-Both files are created automatically on the first run if they do not exist. They are updated in-place after each batch.
-
----
-
-## Output Format
-
-Each sample produces a subdirectory under `--output-dir`:
-
-```
-output/<run_name>/<sample_id>/
-├── traj.jsonl              # Full agent trajectory (turn-by-turn)
-├── metrics.json            # Evaluation score and metadata
-├── exp_summary_prompt.txt  # Trajectory summary prompt sent to the experience model
-├── exp_summary_resp.txt    # Experience model response
-├── online_experiences.json # Per-sample generated experiences
-└── rollout_*/              # Per-rollout subdirectories (when rollouts-per-sample > 1)
-```
-
-A dataset-level summary is written to `output/<run_name>/summary_k.json`.
-
----
 
 ## Citation
 
