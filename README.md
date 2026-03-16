@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/X-Agent.png" alt="XSkill Logo" width="200">
+  <img src="assets/XSkill.png" alt="XSkill Logo" width="200">
 </p>
 
 # XSkill: Continual Learning from Experience and Skills in Multimodal Agents
