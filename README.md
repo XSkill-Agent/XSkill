@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/X-Agent.png" alt="XSkill Logo" width="200">
+  <img src="assets/XSkill.png" alt="XSkill Logo" width="200">
   <h1 align="center">XSkill: Continual Learning from Experience and Skills<br>in Multimodal Agents</h1>
 </div>
 
