@@ -18,7 +18,17 @@
   </a>
 </p>
 
-<!-- TODO: Add framework overview figure here -->
+---
+
+## News 🔥🔥
+
+- **2026.05.01:** XSkill has been accpeted by ICML 2026, see you in Souel! 🎉
+- **2026.03.12:** We release our paper.
+
+---
+
+## Overview
+
 ![XSkill Framework Overview](assets/framework.png)
 
 Multimodal agents demonstrate impressive problem-solving capabilities but typically operate in isolated episodes without leveraging past experiences. **XSkill** addresses this by combining two complementary forms of accumulated knowledge: task-level **Skills** (structured workflows and tool templates) and action-level **Experiences** (context-specific tactical insights), both automatically extracted from agent trajectories without any parametric training.
