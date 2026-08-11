@@ -11,9 +11,11 @@ API_KEY_2=""
 export REASONING_MODEL_NAME=""
 
 export REASONING_API_KEY=$API_KEY_1
-# MiniMax (OpenAI-compatible) endpoint presets:
-#   global: https://api.minimax.io/v1   |   China: https://api.minimaxi.com/v1
-# For MiniMax-M3 adaptive thinking set REASONING_THINKING="adaptive" (or "disabled").
+# MiniMax OpenAI-compatible chat completion endpoint presets:
+#   global: https://api.minimax.io/v1/chat/completions
+#   China:  https://api.minimaxi.com/v1/chat/completions
+# Models: MiniMax-M3 or MiniMax-M2.7.
+# Only MiniMax-M3 supports REASONING_THINKING="adaptive" or "disabled".
 export REASONING_END_POINT=""
 
 # Optional: Fallback API for round-robin polling

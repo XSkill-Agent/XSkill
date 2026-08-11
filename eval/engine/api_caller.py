@@ -59,7 +59,7 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
     model_lower = model_name.lower()
     is_gemini_model = "gemini" in model_lower
     is_gpt_model = "gpt-5" in model_lower or "o1" in model_lower or "o3" in model_lower
-    is_minimax_model = "minimax" in model_lower
+    is_minimax_m3_model = "minimax-m3" in model_lower
     
     # Check if it is OpenRouter API
     is_openrouter = False
@@ -87,11 +87,11 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
         reasoning_effort = os.environ.get("REASONING_EFFORT")
         if reasoning_effort and reasoning_effort.lower() not in ["none", "false", ""]:
             payload["reasoning_effort"] = reasoning_effort  # "high", "medium", "low", "minimal"
-    elif is_minimax_model:
-        # MiniMax models support adaptive thinking via the "thinking" field.
+    elif is_minimax_m3_model:
+        # MiniMax-M3 supports adaptive thinking via the "thinking" field.
         # Allowed values: "adaptive" (model decides whether to think) or "disabled".
-        thinking_mode = os.environ.get("REASONING_THINKING")
-        if thinking_mode and thinking_mode.lower() not in ["none", "false", ""]:
+        thinking_mode = os.environ.get("REASONING_THINKING", "").lower()
+        if thinking_mode in {"adaptive", "disabled"}:
             payload["thinking"] = {"type": thinking_mode}
     else:
         pass
