@@ -59,6 +59,7 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
     model_lower = model_name.lower()
     is_gemini_model = "gemini" in model_lower
     is_gpt_model = "gpt-5" in model_lower or "o1" in model_lower or "o3" in model_lower
+    is_minimax_m3_model = "minimax-m3" in model_lower
     
     # Check if it is OpenRouter API
     is_openrouter = False
@@ -86,6 +87,12 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
         reasoning_effort = os.environ.get("REASONING_EFFORT")
         if reasoning_effort and reasoning_effort.lower() not in ["none", "false", ""]:
             payload["reasoning_effort"] = reasoning_effort  # "high", "medium", "low", "minimal"
+    elif is_minimax_m3_model:
+        # MiniMax-M3 supports adaptive thinking via the "thinking" field.
+        # Allowed values: "adaptive" (model decides whether to think) or "disabled".
+        thinking_mode = os.environ.get("REASONING_THINKING", "").lower()
+        if thinking_mode in {"adaptive", "disabled"}:
+            payload["thinking"] = {"type": thinking_mode}
     else:
         pass
 
@@ -181,7 +188,7 @@ def _parse_api_response(response, api_name: str, attempt: int = 0, max_attempts:
         content = message.get("content")
         if content and content.strip():
             # Return full message if there's reasoning_details to preserve
-            if "reasoning_details" in message or "reasoning" in message:
+            if "reasoning_details" in message or "reasoning" in message or "reasoning_content" in message:
                 return message, False, None
             return content, False, None
         else:
