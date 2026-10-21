@@ -7,6 +7,23 @@ import time
 import random
 import json
 import requests
+from urllib.parse import urlparse
+
+
+def _is_minimax_endpoint(end_point):
+    endpoint = urlparse(end_point or "")
+    return (
+        endpoint.scheme == "https"
+        and endpoint.hostname in {"api.minimax.io", "api.minimaxi.com"}
+        and endpoint.path.rstrip("/") == "/v1/chat/completions"
+    )
+
+
+def resolve_model_name(model_name, end_point):
+    """Default only unconfigured models on direct MiniMax chat endpoints."""
+    if not model_name and _is_minimax_endpoint(end_point):
+        return "MiniMax-M3.1-Flash"
+    return model_name
 
 # Error code classification: non-retryable (do not retry on these)
 NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
@@ -59,6 +76,8 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
     model_lower = model_name.lower()
     is_gemini_model = "gemini" in model_lower
     is_gpt_model = "gpt-5" in model_lower or "o1" in model_lower or "o3" in model_lower
+    is_minimax_flash_model = model_lower == "minimax-m3.1-flash" and _is_minimax_endpoint(end_point)
+    is_minimax_m3_model = model_lower == "minimax-m3" and _is_minimax_endpoint(end_point)
     
     # Check if it is OpenRouter API
     is_openrouter = False
@@ -86,6 +105,18 @@ def _add_reasoning_param(payload: dict, model_name: str, end_point: str = None):
         reasoning_effort = os.environ.get("REASONING_EFFORT")
         if reasoning_effort and reasoning_effort.lower() not in ["none", "false", ""]:
             payload["reasoning_effort"] = reasoning_effort  # "high", "medium", "low", "minimal"
+    elif is_minimax_flash_model:
+        # MiniMax-M3.1-Flash uses the OpenAI-compatible reasoning_effort field.
+        # "none" is not a valid Flash setting, so omit it rather than sending it.
+        reasoning_effort = os.environ.get("REASONING_EFFORT", "").lower()
+        if reasoning_effort in {"low", "medium", "high", "xhigh", "max"}:
+            payload["reasoning_effort"] = reasoning_effort
+    elif is_minimax_m3_model:
+        # MiniMax-M3 supports adaptive thinking via the "thinking" field.
+        # Allowed values: "adaptive" (model decides whether to think) or "disabled".
+        thinking_mode = os.environ.get("REASONING_THINKING", "").lower()
+        if thinking_mode in {"adaptive", "disabled"}:
+            payload["thinking"] = {"type": thinking_mode}
     else:
         pass
 
@@ -181,7 +212,7 @@ def _parse_api_response(response, api_name: str, attempt: int = 0, max_attempts:
         content = message.get("content")
         if content and content.strip():
             # Return full message if there's reasoning_details to preserve
-            if "reasoning_details" in message or "reasoning" in message:
+            if "reasoning_details" in message or "reasoning" in message or "reasoning_content" in message:
                 return message, False, None
             return content, False, None
         else:
@@ -379,6 +410,7 @@ def call_vision_api(model_name: str, messages: list, sampling_params: dict, max_
     # Get primary API configuration
     api_key_1 = os.environ.get("REASONING_API_KEY")
     end_point_1 = os.environ.get("REASONING_END_POINT")
+    model_name = resolve_model_name(model_name, end_point_1)
 
     if not all([api_key_1, end_point_1]):
         raise ValueError("REASONING_API_KEY and REASONING_END_POINT must be set.")
@@ -405,7 +437,7 @@ def call_vision_api(model_name: str, messages: list, sampling_params: dict, max_
                 all_errors.append(f"Round {attempt + 1}: {error_1}")
             
             # Try fallback API in each Round-Robin
-            result_2, is_429_2, error_2 = _try_single_attempt(api_key_2, end_point_2, model_name, messages, 
+            result_2, is_429_2, error_2 = _try_single_attempt(api_key_2, end_point_2, model_name, messages,
                                                      sampling_params, api_name="Fallback API", tools=tools)
             if result_2 is not None:
                 return result_2

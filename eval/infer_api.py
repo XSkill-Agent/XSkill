@@ -27,6 +27,7 @@ from exskill import (
 )
 
 # API-specific imports
+from engine.api_caller import resolve_model_name
 from engine.api_processors import process_single_sample, set_global_prompts as set_processors_prompts
 
 # Utility functions
@@ -417,8 +418,10 @@ def main(args):
     """
     Main function to run the API-based inference process.
     """
-    # Read model configurations from environment variables (required)
-    args.model_name = os.environ.get("REASONING_MODEL_NAME")
+    # Explicit models are preserved; direct MiniMax endpoints default to Flash.
+    args.model_name = resolve_model_name(
+        os.environ.get("REASONING_MODEL_NAME"), os.environ.get("REASONING_END_POINT")
+    )
     if not args.model_name:
         raise ValueError("REASONING_MODEL_NAME environment variable must be set")
     
